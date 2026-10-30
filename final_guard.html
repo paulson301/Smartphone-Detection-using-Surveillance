@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Ultimate Guard (Memory + Depth)</title>
+    <style>
+        body { margin: 0; background: #050505; color: white; font-family: 'Segoe UI', sans-serif; overflow: hidden; display: flex; flex-direction: column; align-items: center; }
+        
+        /* HEADS UP DISPLAY */
+        #hud {
+            position: absolute; top: 20px; left: 20px; z-index: 50;
+            background: rgba(10, 10, 10, 0.85); padding: 20px; border-radius: 12px;
+            border-left: 5px solid #444; width: 320px;
+            backdrop-filter: blur(5px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            transition: all 0.2s;
+        }
+        .status-big { font-size: 2.2rem; font-weight: 800; color: #888; margin: 0; letter-spacing: 1px; }
+        .reason { font-size: 1rem; color: #00e5ff; margin-top: 5px; font-weight: bold; min-height: 1.5em;}
+        .debug-info { font-size: 0.75rem; color: #555; margin-top: 10px; font-family: monospace; }
+
+        /* MEMORY BAR */
+        .memory-track { width: 100%; height: 4px; background: #333; margin-top: 10px; border-radius: 2px; }
+        .memory-fill { height: 100%; width: 0%; background: #00e5ff; transition: width 0.1s linear; }
+
+        /* CAMERA VIEW */
+        #viewport {
+            position: relative; margin-top: 60px;
+            border: 2px solid #333; border-radius: 12px; overflow: hidden;
+            width: 640px; height: 480px;
+            box-shadow: 0 0 50px rgba(0,0,0,0.8);
+        }
+        video { position: absolute; top: 0; left: 0; transform: scaleX(-1); /* Mirror Effect */ }
+        canvas { position: absolute; top: 0; left: 0; transform: scaleX(-1); }
+
+        /* ALARM FLASH */
+        #flash-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle, rgba(255,0,0,0.4) 0%, rgba(255,0,0,0) 70%);
+            opacity: 0; pointer-events: none; z-index: 40; transition: opacity 0.1s;
+        }
+
+        /* BUTTONS */
+        #start-screen {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 100;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+        }
+        button { 
+            padding: 15px 50px; font-size: 1.2rem; font-weight: bold; color: #000;
+            background: #00e5ff; border: none; border-radius: 50px; cursor: pointer;
+            box-shadow: 0 0 20px rgba(0, 229, 255, 0.4); transition: transform 0.2s;
+        }
+        button:hover { transform: scale(1.05); background: #fff; }
+        #loading { display: none; color: #00e5ff; margin-top: 20px; font-family: monospace; }
+
+    </style>
+</head>
+<body>
+
+    <div id="start-screen">
+        <h1 style="font-size: 3rem; margin-bottom: 10px; color: white;">SMART GUARD</h1>
+        <p style="color:#888; margin-bottom: 40px;">Tracks: Eyes, Distance & Memory</p>
+        <button onclick="startSystem()">ACTIVATE</button>
+        <div id="loading">LOADING NEURAL NETWORKS...</div>
+    </div>
+
+    <div id="flash-overlay"></div>
+
+    <div id="hud">
+        <div style="font-size: 0.7rem; color: #666; letter-spacing: 2px;">DETECTION STATUS</div>
+        <div id="status" class="status-big">SAFE</div>
+        <div id="reason" class="reason">Monitoring...</div>
+        
+        <div class="memory-track">
+            <div id="memory-bar" class="memory-fill"></div>
+        </div>
+        <div style="font-size: 0.6rem; color: #666; text-align: right;">PHONE MEMORY</div>
+
+        <div id="debug" class="debug-info">Face Scale: 0 | Dist: 0</div>
+    </div>
+
+    <div id="viewport">
+        <video id="video" width="640" height="480" autoplay muted playsinline></video>
+        <canvas id="canvas" width="640" height="480"></canvas>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/posenet"></script>
+
+    <script>
+        // --- SETTINGS ---
+        const VISION_MULTIPLIER = 2.8;  
+        const CALL_MULTIPLIER = 1.4;    
+        const MEMORY_LIMIT = 3000; // 3 Seconds Memory
+
+        let objectModel, poseModel;
+        let audioCtx, alarmOsc;
+        let isRinging = false;
+        
+        // NEW: Memory Variable
+        let lastPhoneSeenTime = 0;
+
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const reasonEl = document.getElementById('reason');
+        const hudEl = document.getElementById('hud');
+        const debugEl = document.getElementById('debug');
+        const flashEl = document.getElementById('flash-overlay');
+        const memBar = document.getElementById('memory-bar');
+
+        async function startSystem() {
+            document.querySelector('button').style.display = 'none';
+            document.getElementById('loading').style.display = 'block';
+
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+            video.srcObject = stream;
+            
+            await new Promise(resolve => {
+                video.onloadedmetadata = () => {
+                    video.play();
+                    resolve();
+                };
+            });
+
+            objectModel = await cocoSsd.load();
+            poseModel = await posenet.load({
+                architecture: 'MobileNetV1',
+                outputStride: 16,
+                inputResolution: { width: 640, height: 480 },
+                multiplier: 0.75 
+            });
+
+            document.getElementById('start-screen').style.display = 'none';
+            detectFrame();
+        }
+
+        async function detectFrame() {
+            const now = Date.now();
+            const [predictions, pose] = await Promise.all([
+                objectModel.detect(video),
+                poseModel.estimateSinglePose(video, { flipHorizontal: false })
+            ]);
+
+            ctx.clearRect(0, 0, 640, 480);
+            
+            let alarmActive = false;
+            let alarmReason = "";
+            let faceSize = 0; 
+            let phoneVisuallyDetected = false;
+
+            // --- 1. MEMORY UPDATE ---
+            // Check if phone is visible right now
+            predictions.forEach(p => {
+                if (p.class === 'cell phone' && p.score > 0.6) {
+                    phoneVisuallyDetected = true;
+                    lastPhoneSeenTime = now; // RESET TIMER
+                    
+                    const [x, y, w, h] = p.bbox;
+                    ctx.strokeStyle = "white"; ctx.lineWidth = 2;
+                    ctx.strokeRect(x, y, w, h);
+                }
+            });
+
+            // Update Memory Bar UI
+            const timeSincePhone = now - lastPhoneSeenTime;
+            const memoryStrength = Math.max(0, 1 - (timeSincePhone / MEMORY_LIMIT));
+            memBar.style.width = (memoryStrength * 100) + "%";
+            memBar.style.backgroundColor = memoryStrength > 0 ? "#00e5ff" : "#333";
+
+
+            // --- 2. ANALYZE FACE ---
+            const leftEar = pose.keypoints.find(k => k.part === 'leftEar');
+            const rightEar = pose.keypoints.find(k => k.part === 'rightEar');
+            const nose = pose.keypoints.find(k => k.part === 'nose');
+
+            let hasFace = (leftEar.score > 0.3 && rightEar.score > 0.3 && nose.score > 0.4);
+
+            if (hasFace) {
+                faceSize = Math.hypot(leftEar.position.x - rightEar.position.x, leftEar.position.y - rightEar.position.y);
+                
+                const visionRadius = faceSize * VISION_MULTIPLIER;
+                const callDistLimit = faceSize * CALL_MULTIPLIER;
+
+                // Draw Vision Zone
+                ctx.beginPath();
+                ctx.arc(nose.position.x, nose.position.y, visionRadius, 0, 2 * Math.PI);
+                ctx.strokeStyle = "rgba(0, 229, 255, 0.3)"; 
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 10]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // --- 3. CHECK FOR CALLING (Wrist near Ear) ---
+                const leftWrist = pose.keypoints.find(k => k.part === 'leftWrist');
+                const rightWrist = pose.keypoints.find(k => k.part === 'rightWrist');
+
+                const checkCall = (ear, wrist) => {
+                    if (ear.score > 0.2 && wrist.score > 0.2) {
+                        const dist = Math.hypot(ear.position.x - wrist.position.x, ear.position.y - wrist.position.y);
+                        
+                        // Visual Line
+                        ctx.beginPath(); ctx.moveTo(ear.position.x, ear.position.y); ctx.lineTo(wrist.position.x, wrist.position.y);
+                        
+                        // FIX: Only turn red if MEMORY IS ACTIVE
+                        const isClose = dist < callDistLimit;
+                        const isRemembered = memoryStrength > 0;
+
+                        if (isClose && isRemembered) {
+                            ctx.strokeStyle = "red"; ctx.lineWidth = 4;
+                            ctx.stroke();
+                            return true;
+                        } else if (isClose && !isRemembered) {
+                            ctx.strokeStyle = "#00ff00"; ctx.lineWidth = 2; // Green = Safe (Empty hand)
+                            ctx.stroke();
+                            ctx.fillStyle = "#00ff00"; ctx.fillText("Empty Hand", wrist.position.x, wrist.position.y);
+                            return false;
+                        } else {
+                            ctx.strokeStyle = "#333"; ctx.lineWidth = 1;
+                            ctx.stroke();
+                            return false;
+                        }
+                    }
+                    return false;
+                };
+
+                // CRITICAL FIX: The checkCall function now internally checks memory,
+                // but we also ensure alarm only triggers if checkCall returns true
+                if (checkCall(leftEar, leftWrist) || checkCall(rightEar, rightWrist)) {
+                    alarmActive = true;
+                    alarmReason = "CALL DETECTED";
+                    // Hack: Keep memory alive during the call so alarm doesn't flicker
+                    lastPhoneSeenTime = now; 
+                }
+
+                // --- 4. CHECK FOR EYE CONTACT ---
+                if (phoneVisuallyDetected) {
+                    predictions.forEach(p => {
+                        if (p.class === 'cell phone') {
+                            const [x, y, w, h] = p.bbox;
+                            const phoneX = x + w/2;
+                            const phoneY = y + h/2;
+                            const distToNose = Math.hypot(phoneX - nose.position.x, phoneY - nose.position.y);
+
+                            if (distToNose < visionRadius) {
+                                alarmActive = true;
+                                alarmReason = "EYE CONTACT";
+                                ctx.strokeStyle = "red"; ctx.strokeRect(x, y, w, h);
+                                ctx.beginPath(); ctx.moveTo(nose.position.x, nose.position.y); ctx.lineTo(phoneX, phoneY);
+                                ctx.strokeStyle = "red"; ctx.stroke();
+                            }
+                        }
+                    });
+                }
+
+                debugEl.innerText = `FaceWidth: ${Math.round(faceSize)} | Memory: ${Math.round(memoryStrength*100)}%`;
+
+            } else {
+                debugEl.innerText = "No face detected";
+            }
+
+            // --- ALARM TRIGGER ---
+            if (alarmActive) {
+                triggerAlarm(true);
+                statusEl.innerText = "VIOLATION";
+                statusEl.style.color = "#ff2222";
+                reasonEl.innerText = alarmReason;
+                hudEl.style.borderColor = "#ff2222";
+                flashEl.style.opacity = 0.4;
+            } else {
+                triggerAlarm(false);
+                statusEl.innerText = "SAFE";
+                statusEl.style.color = "#888";
+                reasonEl.innerText = memoryStrength > 0 ? "Phone Nearby..." : "No Phone";
+                hudEl.style.borderColor = "#444";
+                flashEl.style.opacity = 0;
+            }
+
+            requestAnimationFrame(detectFrame);
+        }
+
+        function triggerAlarm(shouldRing) {
+            if (shouldRing) {
+                if (isRinging) return;
+                isRinging = true;
+
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(700, audioCtx.currentTime);
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start();
+                alarmOsc = { osc, gain };
+
+                alarmOsc.interval = setInterval(() => {
+                    if (audioCtx.state === 'suspended') audioCtx.resume();
+                    const t = audioCtx.currentTime;
+                    osc.frequency.setValueAtTime(700, t);
+                    osc.frequency.linearRampToValueAtTime(1000, t + 0.1);
+                }, 200);
+
+            } else {
+                if (!isRinging) return;
+                isRinging = false;
+                if (alarmOsc) {
+                    alarmOsc.osc.stop();
+                    alarmOsc.osc.disconnect();
+                    clearInterval(alarmOsc.interval);
+                    alarmOsc = null;
+                }
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Eye-Gaze Phone Guard</title>
+    <style>
+        body { margin: 0; background: #111; color: white; font-family: 'Segoe UI', sans-serif; overflow: hidden; display: flex; flex-direction: column; align-items: center; }
+        
+        #hud {
+            position: absolute; top: 20px; left: 20px; z-index: 50;
+            background: rgba(0, 0, 0, 0.9); padding: 20px; border-radius: 12px;
+            border-left: 5px solid #00ff00; width: 340px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        .status-big { font-size: 2rem; font-weight: 800; color: #00ff00; margin: 5px 0; }
+        .sub-text { font-size: 0.85rem; color: #bbb; line-height: 1.4; margin-top: 5px; }
+        
+        #viewport {
+            position: relative; margin-top: 80px;
+            border: 2px solid #333; border-radius: 10px; overflow: hidden;
+            width: 640px; height: 480px;
+        }
+        video, canvas { position: absolute; top: 0; left: 0; }
+        
+        #flash {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: red; opacity: 0; pointer-events: none; z-index: 40; transition: opacity 0.1s;
+        }
+
+        /* START SCREEN */
+        #start-screen {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 100;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+        }
+        button { padding: 15px 40px; font-size: 1.2rem; cursor: pointer; background: #00ff00; border: none; font-weight: bold; border-radius: 50px; }
+        button:hover { box-shadow: 0 0 20px #00ff00; }
+        #loading { display: none; color: #00ff00; margin-top: 20px; }
+    </style>
+</head>
+<body>
+
+    <div id="start-screen">
+        <h1>GAZE DETECTION GUARD</h1>
+        <p style="color:#888; margin-bottom: 30px;">Only rings when phone enters your "Vision Zone"</p>
+        <button onclick="init()">START TRACKING</button>
+        <div id="loading">Initializing AI Vision...</div>
+    </div>
+
+    <div id="flash"></div>
+
+    <div id="hud">
+        <div style="font-size: 0.8rem; color: #666;">CURRENT STATUS</div>
+        <div id="status-text" class="status-big">SAFE</div>
+        
+        <div class="sub-text">
+            <b>Vision Logic:</b><br>
+            <span style="color: yellow;">Yellow Circle</span> = Your Eye Focus Area.<br>
+            <span style="color: red;">Red Box</span> = Phone.<br>
+            <br>
+            Alarm triggers <b>ONLY</b> when Red Box touches Yellow Circle.
+        </div>
+    </div>
+
+    <div id="viewport">
+        <video id="video" width="640" height="480" autoplay muted playsinline></video>
+        <canvas id="canvas" width="640" height="480"></canvas>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/posenet"></script>
+
+    <script>
+        // --- CONFIGURATION ---
+        const VISION_RADIUS = 220; // Size of the "Vision Zone" circle around your nose (Pixels)
+        
+        let objectModel, poseModel;
+        let audioCtx, alarmOsc;
+        let isRinging = false;
+
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status-text');
+        const hudEl = document.getElementById('hud');
+        const flashEl = document.getElementById('flash');
+
+        async function init() {
+            document.querySelector('button').style.display = 'none';
+            document.getElementById('loading').style.display = 'block';
+
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+            // 1. Camera
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+            video.srcObject = stream;
+            await new Promise(r => video.onloadedmetadata = () => { video.play(); r(); });
+
+            // 2. Load Models
+            console.log("Loading Models...");
+            objectModel = await cocoSsd.load();
+            poseModel = await posenet.load({
+                architecture: 'MobileNetV1', outputStride: 16,
+                inputResolution: { width: 640, height: 480 }, multiplier: 0.5
+            });
+
+            document.getElementById('start-screen').style.display = 'none';
+            detectLoop();
+        }
+
+        async function detectLoop() {
+            // Run detections
+            const [predictions, pose] = await Promise.all([
+                objectModel.detect(video),
+                poseModel.estimateSinglePose(video, { flipHorizontal: false })
+            ]);
+
+            ctx.clearRect(0, 0, 640, 480);
+            
+            // 1. Find the NOSE (Center of Vision)
+            let nose = pose.keypoints.find(k => k.part === 'nose');
+            let hasFace = (nose.score > 0.4);
+            
+            if (hasFace) {
+                // Draw Vision Zone (Yellow Circle)
+                ctx.beginPath();
+                ctx.arc(nose.position.x, nose.position.y, VISION_RADIUS, 0, 2 * Math.PI);
+                ctx.strokeStyle = "rgba(255, 255, 0, 0.5)";
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                
+                // Draw Label
+                ctx.fillStyle = "yellow";
+                ctx.fillText("VISION ZONE", nose.position.x - 40, nose.position.y - VISION_RADIUS - 10);
+            }
+
+            // 2. Find the PHONE
+            let alarmTrigger = false;
+            
+            predictions.forEach(p => {
+                if (p.class === 'cell phone' && p.score > 0.6) {
+                    const [x, y, w, h] = p.bbox;
+                    const phoneCenterX = x + w/2;
+                    const phoneCenterY = y + h/2;
+
+                    // Draw Phone Box
+                    ctx.strokeStyle = "cyan";
+                    ctx.lineWidth = 3;
+                    ctx.strokeRect(x, y, w, h);
+
+                    // 3. CALCULATE DISTANCE (Phone vs Nose)
+                    if (hasFace) {
+                        const dist = Math.hypot(phoneCenterX - nose.position.x, phoneCenterY - nose.position.y);
+                        
+                        // Draw Connection Line
+                        ctx.beginPath();
+                        ctx.moveTo(nose.position.x, nose.position.y);
+                        ctx.lineTo(phoneCenterX, phoneCenterY);
+                        ctx.strokeStyle = (dist < VISION_RADIUS) ? "red" : "#333";
+                        ctx.lineWidth = (dist < VISION_RADIUS) ? 4 : 1;
+                        ctx.stroke();
+
+                        // 4. THE DECISION LOGIC
+                        // Only Ring if Distance < Vision Radius
+                        if (dist < VISION_RADIUS) {
+                            alarmTrigger = true;
+                            
+                            // Visual Feedback: Turn Box Red
+                            ctx.strokeStyle = "red";
+                            ctx.strokeRect(x, y, w, h);
+                            ctx.fillStyle = "red";
+                            ctx.fillText("EYE CONTACT DETECTED", x, y - 10);
+                        } else {
+                            // Phone is safe (held away)
+                            ctx.fillStyle = "cyan";
+                            ctx.fillText("PHONE IGNORED (Too far)", x, y - 10);
+                        }
+                    }
+                }
+            });
+
+            // --- ALARM STATE ---
+            if (alarmTrigger) {
+                startAlarm();
+                statusEl.innerText = "EYES ON PHONE!";
+                statusEl.style.color = "red";
+                hudEl.style.borderColor = "red";
+                flashEl.style.opacity = 0.3;
+            } else {
+                stopAlarm();
+                statusEl.innerText = "SAFE";
+                statusEl.style.color = "#00ff00";
+                hudEl.style.borderColor = "#00ff00";
+                flashEl.style.opacity = 0;
+            }
+
+            requestAnimationFrame(detectLoop);
+        }
+
+        // --- AUDIO ---
+        function startAlarm() {
+            if (isRinging) return;
+            isRinging = true;
+            
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            alarmOsc = { osc, gain };
+            
+            // Beep-Beep
+            alarmOsc.interval = setInterval(() => {
+               if(audioCtx.state === 'suspended') audioCtx.resume();
+               const t = audioCtx.currentTime;
+               osc.frequency.setValueAtTime(800, t);
+               osc.frequency.setValueAtTime(0, t + 0.1); // Silence gap
+               osc.frequency.setValueAtTime(800, t + 0.2);
+            }, 300);
+        }
+
+        function stopAlarm() {
+            if (!isRinging) return;
+            isRinging = false;
+            if(alarmOsc) {
+                alarmOsc.osc.stop();
+                alarmOsc.osc.disconnect();
+                clearInterval(alarmOsc.interval);
+                alarmOsc = null;
+            }
+        }
+    </script>
+</body>
+</html>
